@@ -21,12 +21,12 @@
 // the alignment and if your machine is little or big endian.  However, those
 // are not in this implementation.
 
+#define PY_SSIZE_T_CLEAN
+
 #include <Python.h>
 #include <fstream>
 #include <iostream>
 #include <sys/stat.h>
-#include "unzip.h"
-#include "crypt.h"
 
 #if PY_MAJOR_VERSION >= 3
 #define IS_PY3K
@@ -95,6 +95,9 @@ static unsigned int MurmurHash2_Stream(ifstream &stream, unsigned int seed) {
 	while(!stream.eof()) {
 		stream.read(buffer, 4096);
 		unsigned int chunklen = stream.gcount();
+		if (!chunklen) {
+			break;
+		}
 	    cur = murmur_loop((const unsigned char *)&buffer[0], chunklen, cur);
 	}
 
@@ -131,59 +134,11 @@ static unsigned int MurmurHash2_ResampledStream(ifstream &stream, unsigned int s
 	unsigned int cur = murmur_initialize(j, seed);
 	cur = murmur_loop((const unsigned char *)&buffer[0], j, cur);
 
-    delete buffer;
+    delete[] buffer;
 
 	return murmur_finalize(cur);
 }
 
-
-static unsigned int MurmurHash2_ZipStream(unzFile &stream, uLong len, unsigned int seed)
-{
-
- 	char buffer[4096];
-	unsigned int cur = murmur_initialize(len, seed);
-
-	while(true) {
-		unsigned int chunklen = unzReadCurrentFile(stream, buffer, 4096);
-		if(chunklen == 0) break;
-		cur = murmur_loop((const unsigned char *)&buffer[0], chunklen, cur);
-	}
-
-	return murmur_finalize(cur);
-}
-
-
-static unsigned int MurmurHash2_ResampledZipStream(unzFile &stream, uLong len, unsigned int seed)
-{
-
-    unsigned char * buffer = new unsigned char [len];
-
- 	unsigned int chunklen = unzReadCurrentFile(stream, buffer, len);
-
-    int j = 0;
-
-    for ( unsigned int x = 0; x < len; x++) {
-        bool copy = true;
-        switch (buffer[x]) {
-            case 0x0a:
-            case 0x0d:
-            case 0x20:
-            case 0x09:
-                copy = false;
-        }
-
-        if (copy) {
-            buffer[j++] = buffer[x];
-        }
-    }
-
-	unsigned int cur = murmur_initialize(j, seed);
-	cur = murmur_loop((const unsigned char *)&buffer[0], j, cur);
-
-    delete buffer;
-
-	return murmur_finalize(cur);
-}
 
 static PyObject * murmur_file_hash(PyObject *self, PyObject *args) {
 
@@ -236,98 +191,10 @@ static PyObject * murmur_string_hash(PyObject *self, PyObject *args) {
 	return Py_BuildValue("I", MurmurHash2_String(s, len, seed));
 }
 
-static PyObject * murmur_zip_fingerprint(PyObject *self, PyObject *args) {
-	const char *filename;
-	unsigned int seed = 0;
-	unz_file_info info;
-	char currentFilename[1024];
-
-	PyObject* result = PyDict_New();
-
-	if (!PyArg_ParseTuple(args, (char *)"s|I", &filename, &seed))
-		return NULL;
-
-	unzFile zip;
-	if (!(zip = unzOpen(filename))) {
-		PyErr_SetString(PyExc_RuntimeError, "Unable to open file");
-		return NULL;
-	}
-
-	int rv = unzGoToFirstFile(zip);
-	while (rv == UNZ_OK) {
-		if (unzGetCurrentFileInfo(zip, &info, currentFilename, 1024, NULL, 0, NULL, 0) != UNZ_OK) break;
-
-		if(unzOpenCurrentFile(zip) != UNZ_OK) {
-			PyErr_SetString(PyExc_RuntimeError, "Unable to open file in zip; corrupted zip?");
-			unzClose(zip);
-			return NULL;
-		}
-		uLong len = info.uncompressed_size;
-
-		unsigned int hash = MurmurHash2_ZipStream(zip, len, seed);
-//		std::cout << (int)len << " " << (unsigned int)hash << " " << currentFilename <<  std::endl;
-		if(unzCloseCurrentFile(zip) == UNZ_CRCERROR) {
-			PyErr_SetString(PyExc_RuntimeError, "File failed CRC check...bailing!");
-			unzClose(zip);
-			return NULL;
-		}
-
-		PyDict_SetItem(result, Py_BuildValue("s", currentFilename), Py_BuildValue("I", hash));
-		rv = unzGoToNextFile(zip);
-	}
-	unzClose(zip);
-	return result;
-}
-
-static PyObject * murmur_resampled_zip_hashes(PyObject *self, PyObject *args) {
-	const char *filename;
-	unsigned int seed = 0;
-	unz_file_info info;
-	char currentFilename[1024];
-
-	PyObject* result = PyDict_New();
-
-	if (!PyArg_ParseTuple(args, (char *)"s|I", &filename, &seed))
-		return NULL;
-
-	unzFile zip;
-	if (!(zip = unzOpen(filename))) {
-		PyErr_SetString(PyExc_RuntimeError, "Unable to open file");
-		return NULL;
-	}
-
-	int rv = unzGoToFirstFile(zip);
-	while (rv == UNZ_OK) {
-		if (unzGetCurrentFileInfo(zip, &info, currentFilename, 1024, NULL, 0, NULL, 0) != UNZ_OK) break;
-
-		if(unzOpenCurrentFile(zip) != UNZ_OK) {
-			PyErr_SetString(PyExc_RuntimeError, "Unable to open file in zip; corrupted zip?");
-			unzClose(zip);
-			return NULL;
-		}
-		uLong len = info.uncompressed_size;
-
-		unsigned int hash = MurmurHash2_ResampledZipStream(zip, len, seed);
-
-		if(unzCloseCurrentFile(zip) == UNZ_CRCERROR) {
-			PyErr_SetString(PyExc_RuntimeError, "File failed CRC check...bailing!");
-			unzClose(zip);
-			return NULL;
-		}
-
-		PyDict_SetItem(result, Py_BuildValue("s", currentFilename), Py_BuildValue("I", hash));
-		rv = unzGoToNextFile(zip);
-	}
-	unzClose(zip);
-	return result;
-}
-
 static PyMethodDef MurmurMethods[] = {
 	{"file_hash", murmur_file_hash, METH_VARARGS, "Hash a file"},
 	{"resampled_file_hash", murmur_resampled_file_hash, METH_VARARGS, "Resample and then hash a file"},
 	{"string_hash", murmur_string_hash, METH_VARARGS, "Hash a string"},
-	{"zip_hashes", murmur_zip_fingerprint, METH_VARARGS, "Get a dict of hashes from a zip file"},
-	{"resampled_zip_hashes", murmur_resampled_zip_hashes, METH_VARARGS, "Get a dict of resampled hashes from a zip file"},
 	{NULL, NULL, 0, NULL}
 };
 
